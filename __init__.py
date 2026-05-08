@@ -176,6 +176,7 @@ current_unet_offload_device = mm.unet_offload_device()
 _aimdo_initialized_devices = set()
 if isinstance(current_device, torch.device) and current_device.type == "cuda" and current_device.index is not None:
     _aimdo_initialized_devices.add(current_device.index)
+_aimdo_legacy_fallback_devices = set()
 
 def set_current_device(device):
     """Set the current device context for MultiGPU operations."""
@@ -330,8 +331,83 @@ def _patch_model_management_current_stream():
     logger.info("[MultiGPU] Patched comfy.model_management.current_stream to honor CUDA device arguments")
     return True
 
+def _aimdo_device_ready(device):
+    """Return whether comfy-aimdo has a device context for a CUDA device."""
+    if not getattr(comfy.memory_management, "aimdo_enabled", False):
+        return False
+
+    target_device = _coerce_torch_device(device)
+    if target_device is None or target_device.type != "cuda" or target_device.index is None:
+        return False
+
+    try:
+        from comfy_aimdo import control as aimdo_control
+        get_devctx = getattr(aimdo_control, "get_devctx", None)
+        if not callable(get_devctx):
+            return False
+        get_devctx(target_device.index)
+        return True
+    except Exception:
+        return False
+
+def _patch_dynamic_model_patcher_for_aimdo_devices():
+    """Route DynamicVRAM only to CUDA devices aimdo actually initialized."""
+    dynamic_patcher = getattr(comfy.model_patcher, "ModelPatcherDynamic", None)
+    if dynamic_patcher is None:
+        return False
+    dynamic_new = getattr(dynamic_patcher, "__new__", None)
+    if not callable(dynamic_new):
+        return False
+    if getattr(dynamic_new, "_multigpu_aimdo_device_guard", False):
+        return False
+
+    def dynamic_patcher_new_with_aimdo_device_guard(
+        cls,
+        model=None,
+        load_device=None,
+        offload_device=None,
+        size=0,
+        weight_inplace_update=False,
+    ):
+        target_device = _coerce_torch_device(load_device)
+        if (
+            getattr(comfy.memory_management, "aimdo_enabled", False)
+            and target_device is not None
+            and target_device.type == "cuda"
+            and target_device.index is not None
+            and not _aimdo_device_ready(target_device)
+        ):
+            if target_device.index not in _aimdo_legacy_fallback_devices:
+                logger.warning(
+                    f"[MultiGPU] comfy_aimdo has no context for {target_device}; "
+                    "using legacy ModelPatcher for this device"
+                )
+                _aimdo_legacy_fallback_devices.add(target_device.index)
+            return comfy.model_patcher.ModelPatcher(
+                model,
+                load_device,
+                offload_device,
+                size,
+                weight_inplace_update,
+            )
+
+        return dynamic_new(
+            cls,
+            model,
+            load_device,
+            offload_device,
+            size,
+            weight_inplace_update,
+        )
+
+    dynamic_patcher_new_with_aimdo_device_guard._multigpu_aimdo_device_guard = True
+    dynamic_patcher_new_with_aimdo_device_guard._multigpu_original = dynamic_new
+    dynamic_patcher.__new__ = staticmethod(dynamic_patcher_new_with_aimdo_device_guard)
+    logger.info("[MultiGPU] Patched ModelPatcherDynamic to guard aimdo device coverage")
+    return True
+
 def _initialize_aimdo_visible_cuda_devices():
-    """Ensure DynamicVRAM initializes every visible CUDA device once when enabled."""
+    """Configure MultiGPU behavior around comfy-aimdo's initialized CUDA devices."""
     if not getattr(comfy.memory_management, "aimdo_enabled", False):
         logger.info("[MultiGPU] DynamicVRAM not enabled; skipping multi-device aimdo initialization")
         return False
@@ -343,6 +419,35 @@ def _initialize_aimdo_visible_cuda_devices():
         from comfy_aimdo import control as aimdo_control
     except ImportError:
         logger.warning("[MultiGPU] comfy_aimdo unavailable during multi-device initialization")
+        return False
+
+    device_ids = list(range(torch.cuda.device_count()))
+    ready_device_ids = []
+    for device_id in device_ids:
+        if _aimdo_device_ready(torch.device("cuda", device_id)):
+            ready_device_ids.append(device_id)
+
+    _aimdo_initialized_devices.clear()
+    _aimdo_initialized_devices.update(ready_device_ids)
+
+    if len(ready_device_ids) == len(device_ids):
+        _aimdo_initialized_devices.update(device_ids)
+        logger.info(f"[MultiGPU] comfy_aimdo already initialized for CUDA devices {device_ids}")
+        return False
+
+    if ready_device_ids:
+        logger.warning(
+            "[MultiGPU] comfy_aimdo initialized CUDA devices "
+            f"{ready_device_ids}, not every visible device {device_ids}; "
+            "leaving initialized devices on DynamicVRAM and falling back per-device elsewhere"
+        )
+    else:
+        logger.warning(
+            "[MultiGPU] comfy_aimdo has no initialized CUDA devices; "
+            "falling back to legacy ModelPatcher per device"
+        )
+    _patch_dynamic_model_patcher_for_aimdo_devices()
+    if len(device_ids) > 1:
         return False
 
     init_device = getattr(aimdo_control, "init_device", None)
