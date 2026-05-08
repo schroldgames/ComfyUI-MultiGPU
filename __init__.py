@@ -480,8 +480,10 @@ def _initialize_aimdo_visible_cuda_devices():
         logger.info(f"[MultiGPU] Initializing comfy_aimdo for CUDA device {device_index}")
         initialized = bool(init_device(device_index))
         logger.info(f"[MultiGPU] comfy_aimdo init_device({device_index}) -> {initialized}")
+        _aimdo_readiness_cache[device_index] = initialized
         if initialized:
             _aimdo_initialized_devices.add(device_index)
+            _aimdo_legacy_fallback_devices.discard(device_index)
             initialized_any = True
 
     return initialized_any
