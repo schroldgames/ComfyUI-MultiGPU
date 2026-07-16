@@ -97,6 +97,8 @@ def _create_distorch_safetensor_v2_override(cls, device_param_name, device_sette
                 clean_kwargs['device'] = 'default'
 
             register_patched_safetensor_modelpatcher()
+            from .clip_dynamic_load_list_guard import register_clip_dynamic_load_list_guard
+            register_clip_dynamic_load_list_guard()
 
             vram_string = ""
             if virtual_vram_gb > 0:
@@ -112,12 +114,19 @@ def _create_distorch_safetensor_v2_override(cls, device_param_name, device_sette
             model_to_check = None
             if hasattr(out[0], 'model'):
                 model_to_check = out[0]
+                logger.info(f"[MultiGPU DisTorch V2] out[0] has .model attribute (type={type(model_to_check).__name__})")
             elif hasattr(out[0], 'patcher') and hasattr(out[0].patcher, 'model'):
                 model_to_check = out[0].patcher
+                logger.info(f"[MultiGPU DisTorch V2] out[0] has .patcher.model (type={type(model_to_check).__name__})")
+            else:
+                logger.warning(f"[MultiGPU DisTorch V2] out[0] type={type(out[0]).__name__} attrs={[a for a in dir(out[0]) if not a.startswith('_')]}, cannot attach _distorch_v2_meta!")
 
             if model_to_check and full_allocation:
                 inner_model = model_to_check.model
                 inner_model._distorch_v2_meta = {"full_allocation": full_allocation}
+                logger.info(f"[MultiGPU DisTorch V2] Set _distorch_v2_meta on {type(inner_model).__name__}=0x{id(inner_model):x}")
+            elif model_to_check:
+                logger.warning("[MultiGPU DisTorch V2] full_allocation is empty, skipping metadata set")
 
             logger.info(f"[MultiGPU DisTorch V2] Full allocation string: {full_allocation}")
 

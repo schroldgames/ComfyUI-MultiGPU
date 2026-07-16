@@ -216,7 +216,7 @@ def register_patched_safetensor_modelpatcher():
             inner_model_id = id(inner_model)
 
             if not hasattr(inner_model, "_distorch_v2_meta"):
-                logger.debug(f"[DISTORCH_SKIP] ModelPatcher=0x{mp_id:x} inner_model=0x{inner_model_id:x} type={type(inner_model).__name__} - no metadata, using standard loading")
+                logger.info(f"[DISTORCH_SKIP] ModelPatcher=0x{mp_id:x} inner_model=0x{inner_model_id:x} type={type(inner_model).__name__} - no _distorch_v2_meta, using standard loading")
                 result = original_partially_load(self, device_to, extra_memory, force_patch_weights)
                 if hasattr(self, '_distorch_block_assignments'):
                     del self._distorch_block_assignments
@@ -272,13 +272,13 @@ def register_patched_safetensor_modelpatcher():
 
                     if current_module_device is not None and str(current_module_device) != str(block_target_device):
                         logger.debug(f"[MultiGPU DisTorch V2] Moving already patched {module_name} to {block_target_device}")
-                        module_object.to(block_target_device)
+                        module_object.to(device=block_target_device, dtype=model_original_dtype)
 
                     mem_counter += module_size
                     continue
 
-                # Step 1: Write block/tensor to compute device first
-                module_object.to(device_to)
+                # Step 1: Write block/tensor to compute device first (preserve original dtype)
+                module_object.to(device=device_to, dtype=model_original_dtype)
 
                 # Step 2: Apply LoRa patches while on compute device
                 weight_key = f"{module_name}.weight"
@@ -307,10 +307,10 @@ def register_patched_safetensor_modelpatcher():
                             setattr(module_object, param_name, new_param)
                             logger.debug(f"[MultiGPU DisTorch V2] Cast {module_name}.{param_name} to FP8 for CPU storage")
 
-                # Step 4: Move to ultimate destination based on DisTorch assignment
+                # Step 4: Move to ultimate destination based on DisTorch assignment (preserve dtype)
                 if str(block_target_device) != str(device_to):
                     logger.debug(f"[MultiGPU DisTorch V2] Moving {module_name} from {device_to} to {block_target_device}")
-                    module_object.to(block_target_device)
+                    module_object.to(device=block_target_device, dtype=model_original_dtype)
                     module_object.comfy_cast_weights = True
 
                 # Mark as patched and update memory counter
@@ -328,6 +328,78 @@ def register_patched_safetensor_modelpatcher():
 
 
         comfy.model_patcher.ModelPatcher.partially_load = new_partially_load
+
+        # Also patch ModelPatcherDynamic.load() directly — large BF16 models use ModelPatcherDynamic
+        # which overrides both partially_load AND load(), completely bypassing the base class patch.
+        dynamic_cls = getattr(comfy.model_patcher, "ModelPatcherDynamic", None)
+        if dynamic_cls:
+            original_dynamic_load = dynamic_cls.load
+
+            def new_dynamic_load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False, dirty=False):
+                inner_model = getattr(self, "model", None)
+                if not hasattr(inner_model, "_distorch_v2_meta"):
+                    return original_dynamic_load(self, device_to=device_to, lowvram_model_memory=lowvram_model_memory, force_patch_weights=force_patch_weights, full_load=full_load, dirty=dirty)
+
+                # If DisTorch2 already loaded blocks for this model (e.g., ComfyUI's partially_load
+                # was called again after inference setup), skip — blocks are already on their devices.
+                if getattr(inner_model, "_distorch_loaded", False):
+                    logger.debug(
+                        f"[MultiGPU DisTorch V2] ModelPatcherDynamic.load() skipping: "
+                        "blocks already distributed by prior call"
+                    )
+                    return None
+
+                # Determine original dtype to preserve it when moving modules across devices.
+                # PyTorch's .to(device) converts float types to FP32 by default, so we must
+                # explicitly pass dtype to prevent BF16 -> FP32 corruption.
+                model_dtype = comfy.utils.weight_dtype(inner_model.state_dict())
+
+                allocations = inner_model._distorch_v2_meta["full_allocation"]
+                device_assignments = analyze_safetensor_loading(self, allocations, is_clip=getattr(self, "is_clip", False))
+                self._distorch_cached_assignments = device_assignments
+
+                # Move base weights to assigned devices. We do NOT apply LoRA patches here because:
+                # (1) patch_weight_to_device creates temporary tensors that can OOM on a nearly-full GPU 0,
+                #     and (2) ComfyUI's ModelPatcherDynamic handles LoRA via deferred _lowvram_function
+                #     computation during inference — we just need base weights in place.
+                loading = self._load_list()
+                loading.sort(reverse=True)
+                mem_counter = 0
+
+                for item in loading:
+                    module_size, module_name, module_object, params = unpack_load_item(item)
+
+                    if hasattr(module_object, "comfy_patched_weights") and module_object.comfy_patched_weights is True:
+                        block_target_device = device_assignments["block_assignments"].get(module_name, device_to)
+                        try:
+                            current_module_device = next(module_object.parameters(recurse=False)).device if any(p.numel() > 0 for p in module_object.parameters(recurse=False)) else None
+                        except StopIteration:
+                            current_module_device = None
+                        if current_module_device is not None and str(current_module_device) != str(block_target_device):
+                            logger.debug(f"[MultiGPU DisTorch V2] Moving patched {module_name} to {block_target_device}")
+                            module_object.to(device=block_target_device, dtype=model_dtype)
+                        mem_counter += module_size
+                        continue
+
+                    block_target_device = device_assignments["block_assignments"].get(module_name, device_to)
+                    module_object.to(device=block_target_device, dtype=model_dtype)
+                    if str(block_target_device) != str(device_to):
+                        logger.debug(f"[MultiGPU DisTorch V2] Moving {module_name} to {block_target_device}")
+                        module_object.comfy_cast_weights = True
+
+                    module_object.comfy_patched_weights = True
+                    mem_counter += module_size
+
+                inner_model._distorch_loaded = True
+                inner_model.current_weight_patches_uuid = self.patches_uuid
+                inner_model.device = device_to
+                logger.info("[MultiGPU DisTorch V2] DisTorch loading completed on ModelPatcherDynamic.")
+                logger.info(f"[MultiGPU DisTorch V2] Total memory: {mem_counter / (1024 * 1024):.2f}MB")
+                return None
+
+            dynamic_cls.load = new_dynamic_load
+            logger.info("[MultiGPU Core Patching] Successfully patched ModelPatcherDynamic.load()")
+
         comfy.model_patcher.ModelPatcher._distorch_patched = True
         logger.info("[MultiGPU Core Patching] Successfully patched ModelPatcher.partially_load")
 

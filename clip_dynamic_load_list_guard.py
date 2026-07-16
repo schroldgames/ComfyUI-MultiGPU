@@ -127,7 +127,17 @@ def register_clip_dynamic_load_list_guard():
         if not for_dynamic:
             return original(self, for_dynamic=for_dynamic, default_device=default_device)
 
+        inner_model = getattr(self, "model", None)
+        has_distorch_meta = hasattr(inner_model, "_distorch_v2_meta") if inner_model else False
+
         if _graph_requires_guard(self.model):
+            if has_distorch_meta:
+                logger.debug(
+                    "[MultiGPU Issue21] DisTorch2 model detected - skipping non-recursive "
+                    "replacement to preserve ComfyUI's dynamic execution logic"
+                )
+                return original(self, for_dynamic=for_dynamic, default_device=default_device)
+
             logger.info("[MultiGPU Issue21] Using non-recursive ModelPatcherDynamic._load_list guard")
             return _safe_dynamic_load_list(self, default_device=default_device)
 
