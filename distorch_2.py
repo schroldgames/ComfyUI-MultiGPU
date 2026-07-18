@@ -16,12 +16,39 @@ from .model_management_mgpu import multigpu_memory_log
 
 
 
+def _get_compute_dtype(state_dict):
+    """Determine the compute dtype for .to(dtype=...) calls.
+
+    Prefers float dtypes (BF16/FP16/FP32) because integer dtypes (int8, int4) are storage-only —
+    casting a float bias or activation to int8 would corrupt it. For quantized models where most
+    elements are int8, we need the *float* dtype for safe device moves. Returns None if no float
+    dtype is found, in which case callers skip the dtype arg entirely (safe: .to(device) without
+    dtype does not alter tensor types).
+    """
+    all_dtypes = {}
+    for k, v in state_dict.items():
+        if hasattr(v, "dtype"):
+            all_dtypes[v.dtype] = all_dtypes.get(v.dtype, 0) + v.numel()
+
+    float_dtypes = {d: c for d, c in all_dtypes.items()
+                    if hasattr(d, "is_floating_point") and d.is_floating_point}
+    return max(float_dtypes, key=float_dtypes.get) if float_dtypes else None
+
+
 def unpack_load_item(item):
-    """Handle ComfyUI 0.6.0+ 5-tuple vs legacy 4-tuple"""
+    """Handle ComfyUI 0.6.0+ 5-tuple vs legacy 4-tuple.
+
+    For quantized models (INT8, etc.), the raw storage size is misleading for VRAM allocation —
+    inference dequantizes on-the-fly and needs the full compute-size VRAM. ComfyUI's _load_list()
+    computes module_offload_mem which adds back this cost for QuantizedTensors. We use that value
+    when available so block distribution reflects actual GPU memory pressure during inference.
+    """
     if len(item) == 5:
         # (module_offload_mem, module_mem, module_name, module_object, params)
-        return item[1], item[2], item[3], item[4]
-    # (module_mem, module_name, module_object, params)
+        # Use offload_mem for quantized models — it accounts for dequantized compute size
+        mem = item[0] if isinstance(item[0], (int, float)) and item[0] != 0 else item[1]
+        return mem, item[2], item[3], item[4]
+    # (module_mem, module_name, module_object, params) — legacy 4-tuple has no offload info
     return item[0], item[1], item[2], item[3]
 
 
@@ -254,8 +281,10 @@ def register_patched_safetensor_modelpatcher():
                 self._distorch_cached_assignments = device_assignments
                 self._distorch_last_allocations = allocations
 
-            model_original_dtype = comfy.utils.weight_dtype(self.model.state_dict())
-            high_precision_loras = getattr(self.model, "_distorch_high_precision_loras", True)
+            model_original_dtype = _get_compute_dtype(self.model.state_dict())
+
+            if model_original_dtype == torch.int8:
+                logger.warning(f"[MultiGPU DisTorch V2] Detected INT8 quantized model — float dtype will be inferred from bias/activation tensors")
             # Use standard ComfyUI load list - the device comparison fix ensures we don't crash
             loading = self._load_list()
             loading.sort(reverse=True)
@@ -272,13 +301,15 @@ def register_patched_safetensor_modelpatcher():
 
                     if current_module_device is not None and str(current_module_device) != str(block_target_device):
                         logger.debug(f"[MultiGPU DisTorch V2] Moving already patched {module_name} to {block_target_device}")
-                        module_object.to(device=block_target_device, dtype=model_original_dtype)
+                        if model_original_dtype is not None:
+                            module_object.to(device=block_target_device, dtype=model_original_dtype)
 
                     mem_counter += module_size
                     continue
 
                 # Step 1: Write block/tensor to compute device first (preserve original dtype)
-                module_object.to(device=device_to, dtype=model_original_dtype)
+                if model_original_dtype is not None:
+                    module_object.to(device=device_to, dtype=model_original_dtype)
 
                 # Step 2: Apply LoRa patches while on compute device
                 weight_key = f"{module_name}.weight"
@@ -295,6 +326,7 @@ def register_patched_safetensor_modelpatcher():
                     module_object.bias_function.extend(self.weight_wrapper_patches[bias_key])
 
                 # Step 3: FP8 casting for CPU storage (if enabled)
+                # Only applies to actual FP8 models — intentionally excludes int8/quantized models.
                 block_target_device = device_assignments['block_assignments'].get(module_name, device_to)
                 has_patches = weight_key in self.patches or bias_key in self.patches
 
@@ -310,7 +342,8 @@ def register_patched_safetensor_modelpatcher():
                 # Step 4: Move to ultimate destination based on DisTorch assignment (preserve dtype)
                 if str(block_target_device) != str(device_to):
                     logger.debug(f"[MultiGPU DisTorch V2] Moving {module_name} from {device_to} to {block_target_device}")
-                    module_object.to(device=block_target_device, dtype=model_original_dtype)
+                    if model_original_dtype is not None:
+                        module_object.to(device=block_target_device, dtype=model_original_dtype)
                     module_object.comfy_cast_weights = True
 
                 # Mark as patched and update memory counter
@@ -349,10 +382,15 @@ def register_patched_safetensor_modelpatcher():
                     )
                     return None
 
-                # Determine original dtype to preserve it when moving modules across devices.
+                # Determine compute dtype to preserve it when moving modules across devices.
                 # PyTorch's .to(device) converts float types to FP32 by default, so we must
                 # explicitly pass dtype to prevent BF16 -> FP32 corruption.
-                model_dtype = comfy.utils.weight_dtype(inner_model.state_dict())
+                # For INT8/quantized models we prefer the float dtype (bias weight) over int8
+                # storage dtype — casting a float bias to int8 would corrupt it.
+                model_dtype = _get_compute_dtype(inner_model.state_dict())
+
+                if model_dtype == torch.int8:
+                    logger.warning(f"[MultiGPU DisTorch V2] Detected INT8 quantized model in ModelPatcherDynamic.load()")
 
                 allocations = inner_model._distorch_v2_meta["full_allocation"]
                 device_assignments = analyze_safetensor_loading(self, allocations, is_clip=getattr(self, "is_clip", False))
@@ -377,12 +415,14 @@ def register_patched_safetensor_modelpatcher():
                             current_module_device = None
                         if current_module_device is not None and str(current_module_device) != str(block_target_device):
                             logger.debug(f"[MultiGPU DisTorch V2] Moving patched {module_name} to {block_target_device}")
-                            module_object.to(device=block_target_device, dtype=model_dtype)
+                            if model_dtype is not None:
+                                module_object.to(device=block_target_device, dtype=model_dtype)
                         mem_counter += module_size
                         continue
 
                     block_target_device = device_assignments["block_assignments"].get(module_name, device_to)
-                    module_object.to(device=block_target_device, dtype=model_dtype)
+                    if model_dtype is not None:
+                        module_object.to(device=block_target_device, dtype=model_dtype)
                     if str(block_target_device) != str(device_to):
                         logger.debug(f"[MultiGPU DisTorch V2] Moving {module_name} to {block_target_device}")
                         module_object.comfy_cast_weights = True
@@ -816,16 +856,9 @@ def calculate_safetensor_vvram_allocation(model_patcher, virtual_vram_str):
 
     logger.info(dash_line)
 
-    # Calculate model size
-    model = model_patcher.model if hasattr(model_patcher, 'model') else model_patcher
-    total_memory = 0
-
-    for name, module in model.named_modules():
-        if hasattr(module, "weight"):
-            if module.weight is not None:
-                total_memory += module.weight.numel() * module.weight.element_size()
-            if hasattr(module, "bias") and module.bias is not None:
-                total_memory += module.bias.numel() * module.bias.element_size()
+    # Calculate model size using the same source as block distribution — unpack_load_item
+    # returns module_offload_mem for ComfyUI 0.6.0+ (accounts for dequantized compute size).
+    total_memory = sum(unpack_load_item(x)[0] for x in model_patcher._load_list())
 
     model_size_gb = total_memory / (1024**3)
     new_model_size_gb = max(0, model_size_gb - virtual_vram_gb)
